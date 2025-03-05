@@ -3,6 +3,9 @@ using RabbitMQ.Client;
 using System.Net.Sockets;
 using NModbus;
 using System.Text;
+using System.Collections.Generic;
+using System.Threading.Channels;
+using System.Collections;
 
 namespace prdocer
 {
@@ -48,6 +51,7 @@ namespace prdocer
                     this.makeConnetion(); // factory 연결 
                     this.rconnection = await this.rfactory.CreateConnectionAsync();
                     this.rchannel = await this.rconnection.CreateChannelAsync();
+                    // await this.rchannel.ExchangeDeclareAsync(exchange: "alarm", type: ExchangeType.Fanout); // 새 exchange 생성
 
                     // [1] PLC 접속 정보 (쓰기 때와 동일하게)
                     string plcIp = "192.168.10.200";
@@ -58,7 +62,16 @@ namespace prdocer
                     ushort startAddress = 0;
                     ushort numRegistersToRead = 10;
 
-                    using(TcpClient client = new TcpClient(plcIp, plcPort))
+                    // 동일 알람 전송 방지 장치
+                    int[] alarmFlagLOW = new int[9];
+                    int[] alarmFlagHIGH = new int[9];
+                    double[] regs = new double[9];
+
+                    double[] LOW = new double[] { 70.0, 90, 5.5, 180, 350, 15, 35, 1.8, 180 };
+                    double[] HIGH = new double[] { 95.0, 320, 6.1, 320, 850, 30, 65, 2.2, 660 };
+                    string[] Procedure = new string[] { "수위", "점도", "PH", "전압", "전류", "온도", "습도", "스프레이 건 공압", "페인트 유량" };
+                    
+                    using (TcpClient client = new TcpClient(plcIp, plcPort))
                     {
                         var tcpfactory = new ModbusFactory();
                         IModbusMaster tcpmaster = tcpfactory.CreateMaster(client);
@@ -67,40 +80,63 @@ namespace prdocer
                             ushort[] registers = tcpmaster.ReadHoldingRegisters(slaveId, startAddress, numRegistersToRead);
                             // b) 읽은 ushort[]를 센서값으로 변환
                             //    (쓰는 쪽에서 GenerateRegisterData()와 동일한 포맷으로 해석)
-                            int reg0 = registers[0];
-                            int reg1 = registers[1];
-                            int reg2 = registers[2];
-                            int reg3 = registers[3];
-                            int reg4 = registers[4];
-                            int reg5 = registers[5];
-                            int reg6 = registers[6];
-                            int reg7 = registers[7];
-                            int reg8 = registers[8];
                             // reg9 = registers[9]; // 예비/확장
-
+                            regs[0] = (double)registers[0]; // level(%)
+                            regs[1] = (double)registers[1]; // 점도(cP)
+                            regs[2] = (double)(registers[2] / 100.0); // PH
+                            regs[3] = (double)registers[3]; // 전압(V)
+                            regs[4] = (double)registers[4]; // 전류(A)
+                            regs[5] = (double)registers[5]; // 온도
+                            regs[6] = (double)registers[6]; // 습도(%)
+                            regs[7] = (double)(registers[7] / 100.0); // bar 
+                            regs[8] = (double)registers[8]; // mL/min
                             // (1) PreTreatment
-                            double level = reg0;        // Level (%)
-                            double viscosity = reg1;        // 점도 (cP)
-                            double pH = reg2 / 100.0; // pH는 x100 스케일링
-                            double voltage = reg3;        // 전압 (V)
-                            double current = reg4;        // 전류 (A)
-
+                            //double level = reg0;        // Level (%)
+                            //double viscosity = reg1;        // 점도 (cP)
+                            //double pH = reg2 / 100.0; // pH는 x100 스케일링
+                            //double voltage = reg3;        // 전압 (V)
+                            //double current = reg4;        // 전류 (A)
                             // (2) Drying
-                            double temperature = reg5;      // 온도 (°C)
-                            double humidity = reg6;      // 습도 (%)
-
+                            //double temperature = reg5;      // 온도 (°C)
+                            //double humidity = reg6;      // 습도 (%)
                             // (3) Painting
-                            double paintPressure = reg7 / 100.0; // bar는 x100 스케일링
-                            double paintFlow = reg8;         // mL/min
-                                                             //string message = $"10, 10, 10, 10, 10, 10, 10, 10, 10, 10";
-                                                             //var body = Encoding.UTF8.GetBytes(message);
+                            //double paintPressure = reg7 / 100.0; // bar는 x100 스케일링
+                            //double paintFlow = reg8;         // mL/min
 
-                            string message = $"{level}, {viscosity}, {pH}, {voltage}, {current}, {temperature}, {humidity}, {paintPressure}, {paintFlow}";
-                            //string message = $"10, 10, 10, 10, 10, 10, 10, 10, 10, 10";
+
+                            // 메세지 생성
+                            string NOW = DateTime.Now.ToString("yyyy-MM-dd hh:mm:ss");
+                            string message = $"{NOW}, {regs[0]}, {regs[1]}, {regs[2]}, {regs[3]}, {regs[4]}, {regs[5]}, {regs[6]}, {regs[7]}, {regs[8]}";
                             var body = Encoding.UTF8.GetBytes(message);
 
                             await this.rchannel.BasicPublishAsync(exchange: "logs", routingKey: string.Empty, body: body);
                             Console.WriteLine($" [x] Sent {message}");
+                            // 임계치 초과, 미만 검사하기
+                            // false면 큐에 알람 넣기, true면 x
+                            // 센서 번호, 센서 값, 임계치 이하, 임계치 이상인지?
+                            for (int i = 0; i < 9; i++)
+                            {
+                                // 임계치 검사 미만
+                                if (regs[i] < LOW[i])
+                                {
+                                    string message2 = $"{NOW}, {Procedure[i]} 센서 {regs[i]}, LOW";
+                                    var body2 = Encoding.UTF8.GetBytes(message2);
+                                    await this.rchannel.BasicPublishAsync(exchange: "alarm", routingKey: string.Empty, body: body2);
+                                    //alarmFlagLOW[i]++;
+                                }
+                                if (regs[i] > HIGH[i])
+                                {
+                                    string message2 = $"{NOW}, {Procedure[i]} 센서 {regs[i]}, LOW";
+                                    var body2 = Encoding.UTF8.GetBytes(message2);
+                                    await this.rchannel.BasicPublishAsync(exchange: "alarm", routingKey: string.Empty, body: body2);
+                                    //alarmFlagHIGH[i]++;
+                                }
+
+                                // 알람 후 1분 동안 동일 알람 발생 방지
+                                //if (alarmFlagHIGH[i] > 0) alarmFlagHIGH[i] = (alarmFlagHIGH[i] + 1) % 61;
+                                //if (alarmFlagLOW[i] > 0) alarmFlagLOW[i] = (alarmFlagLOW[i] + 1) % 61;
+                            }
+                            
                             Thread.Sleep(1000);
                         }
                     }
@@ -109,8 +145,21 @@ namespace prdocer
                 {
                     Console.WriteLine($"연결 실패 다시 시도 : {e.ToString()}");
                 }
-                
             }  // 컨슈머가 큐를 생성함?
+        }
+
+        string inspect_standard(double num, double row, double high)
+        {
+            string message = "";
+            if(num < row)
+            {
+                message = $"{num}, Low";
+            }
+            else
+            {
+                message = $"{num}, High";
+            }
+            return message;
         }
     }
 }
