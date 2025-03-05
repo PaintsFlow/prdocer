@@ -126,7 +126,7 @@ namespace prdocer
                                 }
                                 if (regs[i] > HIGH[i])
                                 {
-                                    string message2 = $"{NOW}, {Procedure[i]} 센서 {regs[i]}, LOW";
+                                    string message2 = $"{NOW}, {Procedure[i]} 센서 {regs[i]}, HIGH";
                                     var body2 = Encoding.UTF8.GetBytes(message2);
                                     await this.rchannel.BasicPublishAsync(exchange: "alarm", routingKey: string.Empty, body: body2);
                                     //alarmFlagHIGH[i]++;
